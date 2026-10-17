@@ -1,0 +1,845 @@
+from fastapi import APIRouter, Depends, Query
+from app.core.database import get_db
+from app.core.security import get_current_user
+from app.services.runway import build_runway_forecast, derive_pool_obligations
+from app.services.subscriptions import amount_paise_from_doc, detect_recurring_subscriptions
+from app.services.wellness import (
+    INDIA_STANDARD_TIME_OFFSET_MINUTES,
+    average_meal_gap_hours,
+    build_wellness_summary,
+    current_meal_gap_hours,
+    is_debit_transaction,
+    is_late_night_activity,
+    is_meal_checkin,
+    meal_signal_events,
+)
+import datetime
+import calendar
+import re
+
+router = APIRouter()
+
+def _to_dict(doc):
+    if not doc:
+        return doc
+    d = dict(doc)
+    if "_id" in d:
+        d["id"] = str(d.pop("_id"))
+    for k, v in d.items():
+        if isinstance(v, datetime.datetime):
+            d[k] = v.isoformat()
+    return d
+
+
+def _campus_timezone_offset_minutes(profile: dict | None) -> int:
+    if profile and profile.get("timezone_offset_minutes") is not None:
+        try:
+            return int(profile["timezone_offset_minutes"])
+        except (TypeError, ValueError):
+            pass
+    return INDIA_STANDARD_TIME_OFFSET_MINUTES
+
+@router.get("")
+async def get_insights(user_id: str = Depends(get_current_user)):
+    db = get_db()
+
+    # Fetch last 60 days of transactions
+    since = datetime.datetime.utcnow() - datetime.timedelta(days=60)
+    cursor = db.transactions.find({"user_id": user_id, "created_at": {"$gte": since}}).sort("created_at", -1)
+    all_txns = await cursor.to_list(length=2000)
+    txns = [t for t in all_txns if t.get("direction", "debit") != "credit"]
+
+    # Fetch profile for exam dates
+    profile = await db.profiles.find_one({"_id": user_id})
+    campus_timezone_offset_minutes = _campus_timezone_offset_minutes(profile)
+
+    now = datetime.datetime.utcnow()
+
+    # ── Category breakdown (last 30 days) ─────────────────────────────────
+    since_30 = now - datetime.timedelta(days=30)
+    checkins_30 = await db.checkin_logs.find({
+        "user_id": user_id,
+        "created_at": {"$gte": since_30},
+    }).sort("created_at", -1).to_list(length=500)
+    cat_totals: dict[str, int] = {}
+    for t in txns:
+        if t.get("created_at", now) >= since_30:
+            cat = t.get("category") or "other"
+            cat_totals[cat] = cat_totals.get(cat, 0) + (t.get("amount") or 0)
+    total_30 = sum(cat_totals.values()) or 1
+    category_breakdown = [
+        {"category": k, "amount_paise": v, "pct": round(v / total_30 * 100)}
+        for k, v in sorted(cat_totals.items(), key=lambda x: -x[1])
+    ]
+
+    # ── Daily spend last 7 days ────────────────────────────────────────────
+    daily_spend = []
+    for i in range(6, -1, -1):
+        day = now - datetime.timedelta(days=i)
+        day_start = day.replace(hour=0, minute=0, second=0, microsecond=0)
+        day_end = day_start + datetime.timedelta(days=1)
+        total = sum(
+            t.get("amount", 0) for t in txns
+            if day_start <= t.get("created_at", now) < day_end
+        )
+        daily_spend.append({
+            "date": day_start.strftime("%a"),
+            "amount_paise": total,
+        })
+
+    # ── After-hours payments (11PM-5AM, last 30 days) ─────────────────────
+    late_txns = [
+        t for t in txns
+        if t.get("created_at") and t.get("created_at", now) >= since_30 and is_late_night_activity(t["created_at"], campus_timezone_offset_minutes)
+    ]
+    late_night_total_paise = sum(t.get("amount", 0) for t in late_txns)
+    late_night_txn_count = len(late_txns)
+
+    # ── Food gap analysis ──────────────────────────────────────────────────
+    food_txns = [t for t in txns if t.get("category") == "food"]
+    food_30 = [t for t in food_txns if t.get("created_at", now) >= since_30]
+    meal_events_30 = meal_signal_events(food_30, checkins_30)
+    food_gap_hours = current_meal_gap_hours(now, meal_events_30, default=0.0)
+    last_food_source = meal_events_30[-1]["source"] if meal_events_30 else None
+    meal_checkin_count_30d = sum(1 for ck in checkins_30 if is_meal_checkin(ck))
+    avg_daily_food = sum(t.get("amount", 0) for t in food_30) / 30 if food_30 else 0.0
+
+    # ── Spending velocity (avg of last 7 days vs prior 7 days) ────────────
+    since_7 = now - datetime.timedelta(days=7)
+    since_14 = now - datetime.timedelta(days=14)
+    spend_7 = sum(t.get("amount", 0) for t in txns if t.get("created_at", now) >= since_7)
+    spend_7_prior = sum(
+        t.get("amount", 0) for t in txns
+        if since_14 <= t.get("created_at", now) < since_7
+    )
+    velocity_pct = 0
+    if spend_7_prior > 0:
+        velocity_pct = round((spend_7 - spend_7_prior) / spend_7_prior * 100)
+
+    # ── Exam window signal ─────────────────────────────────────────────────
+    in_exam_period = False
+    exam_days_left = None
+    if profile:
+        exam_start = profile.get("exam_start_date")
+        exam_end = profile.get("exam_end_date")
+        if exam_start and exam_end:
+            try:
+                es = datetime.datetime.fromisoformat(str(exam_start))
+                ee = datetime.datetime.fromisoformat(str(exam_end) + "T23:59:59")
+                if es <= now <= ee:
+                    in_exam_period = True
+                    exam_days_left = (ee - now).days
+            except Exception:
+                pass
+
+    # ── Mess vs delivery ratio ─────────────────────────────────────────────
+    delivery_keywords = ["blinkit", "zepto", "swiggy", "zomato", "instamart", "dunzo"]
+    delivery_txns = [
+        t for t in food_30
+        if any(kw in (t.get("raw_merchant_string") or "").lower() for kw in delivery_keywords)
+        or any(kw in (t.get("mapped_merchant_name") or "").lower() for kw in delivery_keywords)
+    ]
+    delivery_count = len(delivery_txns)
+    mess_count = max(0, len(food_30) - delivery_count) + meal_checkin_count_30d
+    delivery_spend_paise = sum(t.get("amount", 0) for t in delivery_txns)
+
+    # Calculate unpaid pool debts (committed spend runway impact)
+    unpaid_pool_debt_paise = 0
+    user_doc = await db.users.find_one({"_id": user_id})
+    full_name = user_doc.get("full_name", "") if user_doc else ""
+    if full_name and profile and profile.get("wing_label"):
+        wing_label = profile["wing_label"]
+        def local_name_key(v):
+            return " ".join((v or "").strip().split()).casefold()
+            
+        async for p in db.cart_pools.find({"wing_label": wing_label, "status": "completed", "host_id": {"$ne": user_id}}):
+            pool_id = p["_id"]
+            items_cursor = db.cart_pool_items.find({"pool_id": pool_id})
+            items = await items_cursor.to_list(length=1000)
+            
+            participants = list(set(it["added_by_name"] for it in items if it.get("is_purchased", True)))
+            user_items = [it for it in items if it.get("is_purchased", True) and local_name_key(it["added_by_name"]) == local_name_key(full_name)]
+            if user_items:
+                payments = p.get("payments", [])
+                user_payment = next((pay for pay in payments if local_name_key(pay["name"]) == local_name_key(full_name)), None)
+                if not user_payment or user_payment.get("status") != "verified":
+                    p_items_total = sum(it["estimated_price"] for it in user_items)
+                    final_overhead = p.get("final_overhead", 0)
+                    final_discount = p.get("final_discount", 0)
+                    net_overhead = final_overhead - final_discount
+                    num_people = len(participants)
+                    overhead_share = int(net_overhead / num_people) if num_people > 0 else 0
+                    unpaid_pool_debt_paise += (p_items_total + overhead_share)
+
+    # ── Subscription bleed ─────────────────────────────────────────────────
+    subs_cursor = db.subscriptions.find({
+        "user_id": user_id,
+        "is_active": {"$ne": False},
+        "$or": [
+            {"status": {"$in": ["confirmed", "active", "missed"]}},
+            {"status": {"$exists": False}},
+            {"status": None},
+        ],
+    })
+    subs = await subs_cursor.to_list(length=100)
+    monthly_sub_bleed = sum(amount_paise_from_doc(s) for s in subs)
+
+    return {
+        "category_breakdown": category_breakdown,
+        "daily_spend_7d": daily_spend,
+        "late_night": {
+            "total_paise": late_night_total_paise,
+            "txn_count": late_night_txn_count,
+            "window": "11PM-5AM",
+            "timezone": "Asia/Kolkata",
+        },
+        "food": {
+            "gap_hours": round(food_gap_hours, 1),
+            "avg_daily_paise": round(avg_daily_food),
+            "delivery_count_30d": delivery_count,
+            "mess_count_30d": mess_count,
+            "delivery_spend_paise": delivery_spend_paise,
+            "checkin_count_30d": meal_checkin_count_30d,
+            "last_signal_source": last_food_source,
+        },
+        "velocity": {
+            "pct_change": velocity_pct,
+            "spend_7d_paise": spend_7,
+            "spend_prior_7d_paise": spend_7_prior,
+        },
+        "exam": {
+            "in_exam_period": in_exam_period,
+            "days_left": exam_days_left,
+        },
+        "subscriptions": {
+            "monthly_bleed_paise": monthly_sub_bleed,
+            "count": len(subs),
+        },
+        "unpaid_pool_debt_paise": unpaid_pool_debt_paise
+    }
+
+
+@router.get("/wing-feed")
+async def get_wing_feed(user_id: str = Depends(get_current_user)):
+    """Returns anonymized activity events across the campus for the Wing Activity Feed."""
+    db = get_db()
+    profile = await db.profiles.find_one({"_id": user_id})
+    wing = profile.get("wing_label") if profile else None
+
+    events = []
+    now = datetime.datetime.utcnow()
+    since = now - datetime.timedelta(hours=24)
+
+    # Recent pools (any wing)
+    pool_cursor = db.cart_pools.find({"created_at": {"$gte": since}}).sort("created_at", -1).limit(5)
+    pools = await pool_cursor.to_list(length=5)
+    for p in pools:
+        wing_label = p.get("wing_label", "unknown wing")
+        platform = p.get("platform", "delivery").replace("_", " ")
+        created_at = p.get("created_at", now)
+        mins_ago = int((now - created_at).total_seconds() / 60)
+        events.append({
+            "type": "pool_created",
+            "icon": "🛒",
+            "text": f"New {platform} pool started in {wing_label}",
+            "mins_ago": mins_ago,
+        })
+
+    # Recent merchant mappings (crowdsourced)
+    dir_cursor = db.merchant_directory.find({"updated_at": {"$gte": since}}).sort("updated_at", -1).limit(5)
+    dirs = await dir_cursor.to_list(length=5)
+    for d in dirs:
+        updated_at = d.get("updated_at", now)
+        mins_ago = int((now - updated_at).total_seconds() / 60)
+        name = d.get("display_name", "a merchant")
+        events.append({
+            "type": "merchant_mapped",
+            "icon": "📍",
+            "text": f"'{name}' was identified and added to the campus directory",
+            "mins_ago": mins_ago,
+        })
+
+    # Recent check-ins (anonymized)
+    ck_cursor = db.checkin_logs.find({"created_at": {"$gte": since}}).sort("created_at", -1).limit(3)
+    cks = await ck_cursor.to_list(length=3)
+    for ck in cks:
+        created_at = ck.get("created_at", now)
+        mins_ago = int((now - created_at).total_seconds() / 60)
+        response = ck.get("response", "ate")
+        if is_meal_checkin(ck):
+            text = "A student checked in - meal logged"
+            icon = "🍽️"
+        elif response == "travel_fare_report":
+            text = ck.get("stress_note", "New travel fare report submitted")
+            icon = "🗺️"
+        elif response == "travel_savings":
+            text = ck.get("stress_note", "Saved money on travel fare negotiation")
+            icon = "💰"
+        else:
+            text = "A student checked in - meal was skipped or delayed"
+            icon = "⚠️"
+        if is_meal_checkin(ck):
+            source = str(ck.get("meal_source") or "meal").replace("_", " ")
+            text = f"A student checked in - {source} meal logged"
+        elif response not in {"travel_fare_report", "travel_savings"}:
+            text = "A student checked in - meal was skipped or delayed"
+
+        events.append({
+            "type": "checkin",
+            "icon": icon,
+            "text": text,
+            "mins_ago": mins_ago,
+        })
+
+
+    # Sort all events by recency
+    events.sort(key=lambda e: e["mins_ago"])
+
+    return {"events": events[:8], "wing": wing}
+
+
+def get_cycle_start(cycle_start_day: int, now: datetime.datetime) -> datetime.datetime:
+    y = now.year
+    m = now.month
+    d = now.day
+    try:
+        candidate = datetime.datetime(y, m, cycle_start_day, 0, 0, 0)
+    except ValueError:
+        import calendar
+        _, max_days = calendar.monthrange(y, m)
+        candidate = datetime.datetime(y, m, min(cycle_start_day, max_days), 0, 0, 0)
+        
+    if d >= candidate.day:
+        return candidate
+        
+    prev_m = m - 1 if m > 1 else 12
+    prev_y = y if m > 1 else y - 1
+    try:
+        return datetime.datetime(prev_y, prev_m, cycle_start_day, 0, 0, 0)
+    except ValueError:
+        import calendar
+        _, max_days = calendar.monthrange(prev_y, prev_m)
+        return datetime.datetime(prev_y, prev_m, min(cycle_start_day, max_days), 0, 0, 0)
+
+
+def get_cycle_end(cycle_start: datetime.datetime) -> datetime.datetime:
+    return cycle_start + datetime.timedelta(days=30)
+
+
+async def _load_runway_forecast_for_user(
+    db,
+    *,
+    user_id: str,
+    now: datetime.datetime,
+    profile: dict | None = None,
+):
+    profile = profile or await db.profiles.find_one({"_id": user_id}) or {}
+
+    await detect_recurring_subscriptions(db, user_id)
+
+    history_start = now - datetime.timedelta(days=120)
+    transactions = await db.transactions.find(
+        {"user_id": user_id, "created_at": {"$gte": history_start}}
+    ).sort("created_at", 1).to_list(length=5000)
+    subscriptions = await db.subscriptions.find(
+        {"user_id": user_id, "is_active": {"$ne": False}}
+    ).to_list(length=250)
+
+    user = await db.users.find_one({"_id": user_id}) or {}
+    full_name = str(user.get("full_name") or "").strip()
+    pool_ids: set[str] = set()
+    user_item_query: dict = {"added_by_user_id": user_id}
+    if full_name:
+        name_regex = re.compile(f"^{re.escape(full_name)}$", re.IGNORECASE)
+        user_item_query = {
+            "$or": [
+                {"added_by_user_id": user_id},
+                {"added_by_user_id": {"$exists": False}, "added_by_name": name_regex},
+                {"added_by_user_id": None, "added_by_name": name_regex},
+                {"added_by_user_id": "", "added_by_name": name_regex},
+            ]
+        }
+    user_items = await db.cart_pool_items.find(user_item_query).to_list(length=1000)
+    pool_ids.update(str(item.get("pool_id")) for item in user_items if item.get("pool_id"))
+
+    hosted = await db.cart_pools.find(
+        {"host_id": user_id, "status": {"$in": ["open", "closed", "completed"]}}
+    ).to_list(length=250)
+    pool_ids.update(str(pool.get("_id")) for pool in hosted)
+
+    pools = []
+    pool_items = []
+    if pool_ids:
+        pools = await db.cart_pools.find({"_id": {"$in": list(pool_ids)}}).to_list(length=500)
+        pool_items = await db.cart_pool_items.find({"pool_id": {"$in": list(pool_ids)}}).to_list(length=2500)
+
+    obligations = derive_pool_obligations(
+        pools,
+        pool_items,
+        user_id=user_id,
+        user_name=full_name,
+        now=now,
+    )
+    return build_runway_forecast(
+        profile=profile,
+        transactions=transactions,
+        subscriptions=subscriptions,
+        pool_obligations=obligations,
+        now=now,
+    )
+
+
+@router.get("/forecast")
+async def get_runway_forecast(user_id: str = Depends(get_current_user)):
+    """Return the deterministic Runway Engine V2 forecast for the current user."""
+    db = get_db()
+    now = datetime.datetime.utcnow()
+    profile = await db.profiles.find_one({"_id": user_id}) or {}
+    return await _load_runway_forecast_for_user(
+        db,
+        user_id=user_id,
+        now=now,
+        profile=profile,
+    )
+
+
+@router.get("/wellness")
+async def get_wellness_insights(user_id: str = Depends(get_current_user)):
+    db = get_db()
+    now = datetime.datetime.utcnow()
+
+    # Fetch last 60 days of transactions
+    since = now - datetime.timedelta(days=60)
+    cursor = db.transactions.find({"user_id": user_id, "created_at": {"$gte": since}}).sort("created_at", -1)
+    txns = [t for t in await cursor.to_list(length=2000) if is_debit_transaction(t)]
+    checkins = await db.checkin_logs.find({
+        "user_id": user_id,
+        "created_at": {"$gte": since},
+    }).sort("created_at", -1).to_list(length=1000)
+
+    # Fetch user profile
+    profile = await db.profiles.find_one({"_id": user_id})
+    if not profile:
+        profile = {}
+
+    campus_timezone_offset_minutes = _campus_timezone_offset_minutes(profile)
+
+    # 1. Late-night payment activity (last 7 days, 11PM to 5AM campus time)
+    since_7 = now - datetime.timedelta(days=7)
+    late_txns_7d = [
+        t for t in txns
+        if t.get("created_at") and t["created_at"] >= since_7 and is_late_night_activity(t["created_at"], campus_timezone_offset_minutes)
+    ]
+    late_night_activity_7d = len(late_txns_7d)
+
+    # 2. Meal regularity: avg_food_gap_hours_7d
+    food_txns_7d = [
+        t for t in txns
+        if t.get("category") == "food" and t.get("created_at") and t["created_at"] >= since_7
+    ]
+    checkins_7d = [
+        ck for ck in checkins
+        if ck.get("created_at") and ck["created_at"] >= since_7
+    ]
+    meal_events_7d = meal_signal_events(food_txns_7d, checkins_7d)
+    meal_checkins_7d = sum(1 for ck in checkins_7d if is_meal_checkin(ck))
+    current_food_gap_hours = current_meal_gap_hours(now, meal_events_7d, default=0.0) if meal_events_7d else None
+    avg_food_gap_hours_7d = average_meal_gap_hours(now, meal_events_7d, default=0.0) if meal_events_7d else None
+
+    runway_forecast = await _load_runway_forecast_for_user(
+        db,
+        user_id=user_id,
+        now=now,
+        profile=profile,
+    )
+    runway_days = int(runway_forecast.get("days") or 0)
+    safe_daily_limit_rs = float((runway_forecast.get("safeDailyPaise") or 0) / 100.0)
+
+    # 4. Spending velocity
+    spend_7_rs = sum(t.get("amount", 0) for t in txns if t.get("created_at") and t["created_at"] >= since_7) / 100.0
+    avg_daily_spend_7d_rs = spend_7_rs / 7.0
+    
+    if safe_daily_limit_rs > 0:
+        spend_velocity = avg_daily_spend_7d_rs / safe_daily_limit_rs
+    else:
+        spend_velocity = 1.5 if avg_daily_spend_7d_rs > 0 else 0.0
+
+    # 5. Exam window
+    in_exam_period = False
+    if profile:
+        exam_start = profile.get("exam_start_date")
+        exam_end = profile.get("exam_end_date")
+        if exam_start and exam_end:
+            try:
+                import datetime as dt
+                es = dt.datetime.fromisoformat(str(exam_start))
+                ee = dt.datetime.fromisoformat(str(exam_end) + "T23:59:59")
+                if es <= now <= ee:
+                    in_exam_period = True
+            except Exception:
+                pass
+
+    signal_basis = [
+        "food_payments",
+        "meal_checkins",
+        "runway_forecast",
+        "after_hours_payments",
+        "spend_velocity",
+        "exam_dates",
+    ]
+    summary = build_wellness_summary(
+        meal_events_count_7d=len(meal_events_7d),
+        current_food_gap_hours=current_food_gap_hours,
+        avg_food_gap_hours_7d=avg_food_gap_hours_7d,
+        late_night_activity_7d=late_night_activity_7d,
+        runway_days=runway_days,
+        safe_daily_limit_rs=safe_daily_limit_rs,
+        spend_velocity=spend_velocity,
+        in_exam_period=in_exam_period,
+    )
+
+    return {
+        **summary,
+        "generated_by": "local_rules",
+        "signal_basis": signal_basis,
+        "avg_food_gap_hours_7d": round(avg_food_gap_hours_7d, 1) if avg_food_gap_hours_7d is not None else None,
+        "current_food_gap_hours": round(current_food_gap_hours, 1) if current_food_gap_hours is not None else None,
+        "meal_checkins_7d": meal_checkins_7d,
+        "meal_signals_7d": len(meal_events_7d),
+        "late_night_activity_count_7d": late_night_activity_7d,
+        "late_night_window": "11PM-5AM",
+        "late_night_timezone": "Asia/Kolkata",
+        "disclaimer": "Routine score uses payments, meal check-ins, runway, spend pace, and exam dates only; it is not medical advice.",
+    }
+
+
+# ── Income category inference helper ──────────────────────────────────────
+INCOME_KEYWORDS = {"salary", "income", "allowance", "refund", "cashback", "balance", "credit", "stipend", "scholarship", "reimbursement"}
+
+def _is_income(txn: dict) -> bool:
+    """Determine if a transaction is income based on direction or category/merchant name keywords."""
+    direction = txn.get("direction")
+    if direction == "credit":
+        return True
+    if direction == "debit":
+        return False
+    cat = (txn.get("category") or "").lower()
+    merchant = (txn.get("mapped_merchant_name") or txn.get("raw_merchant_string") or "").lower()
+    return any(kw in cat for kw in INCOME_KEYWORDS) or any(kw in merchant for kw in INCOME_KEYWORDS)
+
+
+@router.get("/stats")
+async def get_stats(
+    month: int = Query(default=None, ge=1, le=12),
+    year: int = Query(default=None, ge=2020, le=2100),
+    user_id: str = Depends(get_current_user),
+):
+    """
+    Comprehensive stats endpoint powering the Stats page, Calendar view,
+    Monthly tab, and Total tab.
+    """
+    db = get_db()
+    now = datetime.datetime.utcnow()
+
+    if month is None:
+        month = now.month
+    if year is None:
+        year = now.year
+
+    # ── Fetch transactions for the requested month ────────────────────────
+    _, days_in_month = calendar.monthrange(year, month)
+    month_start = datetime.datetime(year, month, 1, 0, 0, 0)
+    if month == 12:
+        next_month_start = datetime.datetime(year + 1, 1, 1, 0, 0, 0)
+    else:
+        next_month_start = datetime.datetime(year, month + 1, 1, 0, 0, 0)
+
+    cursor = db.transactions.find({
+        "user_id": user_id,
+        "created_at": {"$gte": month_start, "$lt": next_month_start}
+    }).sort("created_at", -1)
+    txns = await cursor.to_list(length=5000)
+
+    # ── Previous month for comparison ─────────────────────────────────────
+    if month == 1:
+        prev_month, prev_year = 12, year - 1
+    else:
+        prev_month, prev_year = month - 1, year
+    prev_start = datetime.datetime(prev_year, prev_month, 1, 0, 0, 0)
+    prev_next_month_start = month_start
+
+    prev_cursor = db.transactions.find({
+        "user_id": user_id,
+        "created_at": {"$gte": prev_start, "$lt": prev_next_month_start}
+    })
+    prev_txns = await prev_cursor.to_list(length=5000)
+
+    # ── Separate income and expenses ──────────────────────────────────────
+    income_txns = [t for t in txns if _is_income(t)]
+    expense_txns = [t for t in txns if not _is_income(t)]
+
+    total_income = sum(t.get("amount", 0) for t in income_txns)
+    total_expenses = sum(t.get("amount", 0) for t in expense_txns)
+    total_net = total_income - total_expenses
+
+    # ── Daily breakdown (for Calendar view) ───────────────────────────────
+    daily = {}
+    for day in range(1, days_in_month + 1):
+        daily[day] = {"day": day, "income": 0, "expenses": 0, "txn_count": 0}
+
+    for t in txns:
+        d = t.get("created_at")
+        if not d:
+            continue
+        day_num = d.day
+        amt = t.get("amount", 0)
+        if _is_income(t):
+            daily[day_num]["income"] += amt
+        else:
+            daily[day_num]["expenses"] += amt
+        daily[day_num]["txn_count"] += 1
+
+    daily_list = list(daily.values())
+
+    # ── Weekly breakdown ──────────────────────────────────────────────────
+    import math
+    weeks = []
+    first_weekday, _ = calendar.monthrange(year, month)
+    week_start = 1
+    while week_start <= days_in_month:
+        week_end = min(week_start + 6, days_in_month)
+        w_income = 0
+        w_expenses = 0
+        for d in range(week_start, week_end + 1):
+            w_income += daily[d]["income"]
+            w_expenses += daily[d]["expenses"]
+        weeks.append({
+            "start_day": week_start,
+            "end_day": week_end,
+            "label": f"{month:02d}.{week_start:02d} ~ {month:02d}.{week_end:02d}",
+            "income": w_income,
+            "expenses": w_expenses,
+            "net": w_income - w_expenses,
+        })
+        week_start = week_end + 1
+
+    # ── Category breakdown for income ─────────────────────────────────────
+    income_cats: dict[str, int] = {}
+    for t in income_txns:
+        cat = t.get("category") or t.get("mapped_merchant_name") or "other"
+        income_cats[cat] = income_cats.get(cat, 0) + t.get("amount", 0)
+    income_total_for_pct = total_income or 1
+    income_breakdown = [
+        {
+            "category": k,
+            "amount": v,
+            "pct": round(v / income_total_for_pct * 100, 1),
+        }
+        for k, v in sorted(income_cats.items(), key=lambda x: -x[1])
+    ]
+
+    # ── Category breakdown for expenses ───────────────────────────────────
+    expense_cats: dict[str, int] = {}
+    for t in expense_txns:
+        cat = t.get("category") or "other"
+        expense_cats[cat] = expense_cats.get(cat, 0) + t.get("amount", 0)
+    expense_total_for_pct = total_expenses or 1
+    expense_breakdown = [
+        {
+            "category": k,
+            "amount": v,
+            "pct": round(v / expense_total_for_pct * 100, 1),
+        }
+        for k, v in sorted(expense_cats.items(), key=lambda x: -x[1])
+    ]
+
+    # ── Compared expenses vs last month ───────────────────────────────────
+    prev_expenses = sum(t.get("amount", 0) for t in prev_txns if not _is_income(t))
+    compared_expenses_pct = 0
+    if prev_expenses > 0:
+        compared_expenses_pct = round(total_expenses / prev_expenses * 100)
+
+    # ── Yearly monthly summaries ──────────────────────────────────────────
+    year_start = datetime.datetime(year, 1, 1, 0, 0, 0)
+    next_year_start = datetime.datetime(year + 1, 1, 1, 0, 0, 0)
+    year_cursor = db.transactions.find({
+        "user_id": user_id,
+        "created_at": {"$gte": year_start, "$lt": next_year_start}
+    })
+    year_txns = await year_cursor.to_list(length=10000)
+
+    yearly_months = []
+    for m in range(1, 13):
+        m_income = 0
+        m_expenses = 0
+        for t in year_txns:
+            d = t.get("created_at")
+            if d and d.month == m:
+                if _is_income(t):
+                    m_income += t.get("amount", 0)
+                else:
+                    m_expenses += t.get("amount", 0)
+        yearly_months.append({
+            "month": m,
+            "month_name": calendar.month_abbr[m],
+            "income": m_income,
+            "expenses": m_expenses,
+            "net": m_income - m_expenses,
+        })
+
+    # ── Transaction list with daily grouping ──────────────────────────────
+    transactions_by_day = {}
+    for t in txns:
+        d = t.get("created_at")
+        if not d:
+            continue
+        day_key = d.strftime("%Y-%m-%d")
+        if day_key not in transactions_by_day:
+            transactions_by_day[day_key] = {
+                "date": day_key,
+                "day": d.day,
+                "weekday": calendar.day_abbr[d.weekday()],
+                "income": 0,
+                "expenses": 0,
+                "transactions": [],
+            }
+        td = dict(t)
+        if "_id" in td:
+            td["id"] = str(td.pop("_id"))
+        for k, v in td.items():
+            if isinstance(v, datetime.datetime):
+                td[k] = v.isoformat()
+        is_inc = _is_income(t)
+        amt = t.get("amount", 0)
+        if is_inc:
+            transactions_by_day[day_key]["income"] += amt
+        else:
+            transactions_by_day[day_key]["expenses"] += amt
+        td["is_income"] = is_inc
+        transactions_by_day[day_key]["transactions"].append(td)
+
+    # Sort days descending
+    daily_groups = sorted(transactions_by_day.values(), key=lambda x: x["date"], reverse=True)
+
+    # ── Source breakdown ──────────────────────────────────────────────────
+    companion_total = sum(t.get("amount", 0) for t in expense_txns if t.get("source", "").startswith("companion"))
+    manual_total = sum(t.get("amount", 0) for t in expense_txns if t.get("source") == "manual")
+    statement_import_total = sum(t.get("amount", 0) for t in expense_txns if t.get("source") == "statement_import")
+
+    # ── Top merchants (by total expense amount) ───────────────────────────
+    merchant_totals: dict[str, int] = {}
+    merchant_counts: dict[str, int] = {}
+    for t in expense_txns:
+        name = t.get("mapped_merchant_name") or t.get("raw_merchant_string") or "Unknown"
+        merchant_totals[name] = merchant_totals.get(name, 0) + t.get("amount", 0)
+        merchant_counts[name] = merchant_counts.get(name, 0) + 1
+    top_merchants = [
+        {"name": k, "amount": v, "count": merchant_counts.get(k, 0)}
+        for k, v in sorted(merchant_totals.items(), key=lambda x: -x[1])
+    ][:10]
+
+    # ── Hourly spending heatmap (0-23 hours) ──────────────────────────────
+    hourly = [0] * 24
+    for t in expense_txns:
+        d = t.get("created_at")
+        if d:
+            hourly[d.hour] += t.get("amount", 0)
+    hourly_data = [{"hour": h, "amount": hourly[h]} for h in range(24)]
+
+    # ── Day-of-week spending distribution ─────────────────────────────────
+    dow_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    dow_totals = [0] * 7
+    dow_counts = [0] * 7
+    for t in expense_txns:
+        d = t.get("created_at")
+        if d:
+            dow_totals[d.weekday()] += t.get("amount", 0)
+            dow_counts[d.weekday()] += 1
+    day_of_week_data = [
+        {"day": dow_names[i], "amount": dow_totals[i], "count": dow_counts[i]}
+        for i in range(7)
+    ]
+
+    # ── Average daily spend ───────────────────────────────────────────────
+    active_days = sum(1 for d in daily.values() if d["expenses"] > 0)
+    avg_daily_expense = round(total_expenses / active_days) if active_days > 0 else 0
+
+    # ── Biggest single expense transaction ────────────────────────────────
+    biggest_txn = None
+    if expense_txns:
+        bt = max(expense_txns, key=lambda t: t.get("amount", 0))
+        biggest_txn = {
+            "amount": bt.get("amount", 0),
+            "merchant": bt.get("mapped_merchant_name") or bt.get("raw_merchant_string", "Unknown"),
+            "category": bt.get("category", "other"),
+            "date": bt.get("created_at").isoformat() if bt.get("created_at") else None,
+        }
+
+    # ── Transaction counts ────────────────────────────────────────────────
+    txn_count = len(txns)
+    expense_count = len(expense_txns)
+    income_count = len(income_txns)
+
+    # ── Spending streak (consecutive days with expenses) ──────────────────
+    current_streak = 0
+    max_streak = 0
+    streak = 0
+    for day_num in range(1, days_in_month + 1):
+        if daily[day_num]["expenses"] > 0:
+            streak += 1
+            max_streak = max(max_streak, streak)
+        else:
+            streak = 0
+    # Current streak from today backwards
+    today_day = now.day if now.month == month and now.year == year else days_in_month
+    cs = 0
+    for d in range(today_day, 0, -1):
+        if daily[d]["expenses"] > 0:
+            cs += 1
+        else:
+            break
+    current_streak = cs
+
+    # ── Daily expense bar chart data (amounts for each day of month) ──────
+    daily_expense_bars = [
+        {"day": d, "amount": daily[d]["expenses"], "label": f"{d}"}
+        for d in range(1, days_in_month + 1)
+    ]
+
+    return {
+        "month": month,
+        "year": year,
+        "days_in_month": days_in_month,
+        "summary": {
+            "income": total_income,
+            "expenses": total_expenses,
+            "net": total_net,
+        },
+        "daily": daily_list,
+        "weeks": weeks,
+        "income_breakdown": income_breakdown,
+        "expense_breakdown": expense_breakdown,
+        "compared_expenses_pct": compared_expenses_pct,
+        "yearly_months": yearly_months,
+        "daily_groups": daily_groups,
+        "source_breakdown": {
+            "companion": companion_total,
+            "manual": manual_total,
+            "statement_import": statement_import_total,
+        },
+        "top_merchants": top_merchants,
+        "hourly_data": hourly_data,
+        "day_of_week_data": day_of_week_data,
+        "avg_daily_expense": avg_daily_expense,
+        "biggest_txn": biggest_txn,
+        "txn_counts": {
+            "total": txn_count,
+            "expenses": expense_count,
+            "income": income_count,
+        },
+        "streaks": {
+            "current": current_streak,
+            "max": max_streak,
+        },
+        "daily_expense_bars": daily_expense_bars,
+    }

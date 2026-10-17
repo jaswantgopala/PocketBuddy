@@ -1,0 +1,211 @@
+from fastapi import APIRouter, HTTPException, Depends
+from pydantic import BaseModel
+from typing import Optional, List
+import uuid
+import datetime
+from app.core.database import get_db
+from app.core.security import get_current_user, map_doc, map_docs
+from app.services.subscriptions import (
+    clean_merchant_name,
+    next_future_debit,
+    subscription_name_for_merchant,
+    upsert_subscription,
+    upsert_subscription_for_transaction,
+)
+
+router = APIRouter()
+
+class TxnReq(BaseModel):
+    amount: int
+    raw_merchant_string: str
+    category: Optional[str] = None
+    source: str = "manual"
+    is_mapped: bool = True
+    mapped_merchant_name: Optional[str] = None
+    direction: Optional[str] = "debit"
+
+class IdentifyReq(BaseModel):
+    category: str
+    display_name: str
+
+class UpdateTxnReq(BaseModel):
+    mapped_merchant_name: Optional[str] = None
+    category: Optional[str] = None
+    direction: Optional[str] = None
+
+def clean_transaction_label(value: str, field_name: str, max_length: int) -> str:
+    cleaned = value.strip()
+    if not cleaned:
+        raise HTTPException(status_code=400, detail=f"{field_name} cannot be empty")
+    if len(cleaned) > max_length:
+        raise HTTPException(status_code=400, detail=f"{field_name} is too long")
+    return cleaned
+
+@router.get("")
+async def get_transactions(user_id: str = Depends(get_current_user)):
+    db = get_db()
+    cursor = db.transactions.find({"user_id": user_id}).sort("created_at", -1)
+    txns = await cursor.to_list(length=1000)
+    return map_docs(txns)
+
+@router.post("")
+async def insert_transaction(req: TxnReq, user_id: str = Depends(get_current_user)):
+    db = get_db()
+    txn_id = str(uuid.uuid4())
+    if req.amount <= 0:
+        raise HTTPException(status_code=400, detail="Amount must be positive")
+    direction = (req.direction or "debit").strip().lower()
+    if direction not in {"debit", "credit"}:
+        raise HTTPException(status_code=400, detail="Direction must be 'debit' or 'credit'")
+    category = (req.category or "other").strip().lower() or "other"
+    raw_merchant = clean_transaction_label(req.raw_merchant_string, "Merchant", 120)
+    mapped_merchant = (
+        clean_transaction_label(req.mapped_merchant_name, "Mapped merchant", 120)
+        if req.mapped_merchant_name
+        else raw_merchant
+    )
+    
+    new_txn = {
+        "_id": txn_id,
+        "user_id": user_id,
+        "amount": req.amount,
+        "raw_merchant_string": raw_merchant,
+        "mapped_merchant_name": mapped_merchant,
+        "category": category,
+        "source": req.source,
+        "is_mapped": req.is_mapped,
+        "direction": direction,
+        "data_origin": "user_entered",
+        "privacy_mode": "manual_entry",
+        "raw_payload_received": False,
+        "verification_status": "manual_entry",
+        "parsing_confidence": "high",
+        "needs_verification": False,
+        "created_at": datetime.datetime.utcnow()
+    }
+    
+    await db.transactions.insert_one(new_txn)
+    merchant = new_txn["mapped_merchant_name"] or new_txn["raw_merchant_string"]
+    service_name = subscription_name_for_merchant(merchant)
+    if new_txn["category"] == "subscription" and new_txn["direction"] == "debit":
+        service_name = service_name or clean_merchant_name(merchant)
+        if service_name:
+            await upsert_subscription(
+                db,
+                user_id=user_id,
+                service_name=service_name,
+                amount_paise=new_txn["amount"],
+                next_debit_date=next_future_debit(new_txn["created_at"], 30),
+                detected_from="manual_transaction",
+                observed_at=new_txn["created_at"],
+                observed_interval_days=30,
+            )
+    elif service_name and new_txn["direction"] == "debit":
+        await upsert_subscription_for_transaction(
+            db,
+            user_id=user_id,
+            merchant=merchant,
+            amount_paise=new_txn["amount"],
+            observed_at=new_txn["created_at"],
+            detected_from="auto_detected",
+        )
+    return map_doc(new_txn)
+
+@router.post("/delete-recent")
+async def delete_recent(req: dict, user_id: str = Depends(get_current_user)):
+    db = get_db()
+    start_date = req.get("startDate")
+    if not start_date:
+        raise HTTPException(status_code=400, detail="Missing startDate")
+        
+    dt = datetime.datetime.fromisoformat(start_date.replace("Z", "+00:00"))
+    result = await db.transactions.delete_many({
+        "user_id": user_id,
+        "created_at": {"$gte": dt}
+    })
+    return {"status": "ok", "deleted_count": result.deleted_count}
+
+@router.post("/{txn_id}/identify")
+async def identify_merchant(txn_id: str, req: IdentifyReq, user_id: str = Depends(get_current_user)):
+    db = get_db()
+    txn = await db.transactions.find_one({"_id": txn_id, "user_id": user_id})
+    if not txn:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+        
+    raw_string = txn["raw_merchant_string"]
+    display_name = clean_transaction_label(req.display_name, "Display name", 80)
+    category = clean_transaction_label(req.category, "Category", 40)
+    
+    # Update directory
+    await db.merchant_directory.update_one(
+        {"raw_string": raw_string},
+        {"$set": {
+            "display_name": display_name,
+            "category": category,
+            "verified": True,
+            "updated_at": datetime.datetime.utcnow()
+        }},
+        upsert=True
+    )
+    
+    # Retroactively update all txns for this user with the same raw string
+    await db.transactions.update_many(
+        {"user_id": user_id, "raw_merchant_string": raw_string},
+        {"$set": {
+            "is_mapped": True,
+            "mapped_merchant_name": display_name,
+            "category": category
+        }}
+    )
+    
+    return {"status": "ok"}
+
+@router.patch("/{txn_id}")
+async def update_transaction(txn_id: str, req: UpdateTxnReq, user_id: str = Depends(get_current_user)):
+    db = get_db()
+    txn = await db.transactions.find_one({"_id": txn_id, "user_id": user_id})
+    if not txn:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+        
+    update_data = {}
+    if req.mapped_merchant_name is not None:
+        update_data["mapped_merchant_name"] = clean_transaction_label(
+            req.mapped_merchant_name,
+            "Display name",
+            80,
+        )
+        update_data["is_mapped"] = True
+    if req.category is not None:
+        update_data["category"] = clean_transaction_label(req.category, "Category", 40)
+    if req.direction is not None:
+        update_data["direction"] = clean_transaction_label(req.direction, "Direction", 20)
+        
+    if update_data:
+        update_data["needs_verification"] = False
+        update_data["verification_status"] = "user_reviewed"
+        update_data["user_confirmed_at"] = datetime.datetime.utcnow()
+        await db.transactions.update_one(
+            {"_id": txn_id, "user_id": user_id},
+            {"$set": update_data}
+        )
+    return {"status": "ok"}
+
+@router.post("/{txn_id}/confirm")
+async def confirm_transaction(txn_id: str, user_id: str = Depends(get_current_user)):
+    """Mark a low-confidence transaction as user-reviewed and clear needs_verification flag."""
+    db = get_db()
+    txn = await db.transactions.find_one({"_id": txn_id, "user_id": user_id})
+    if not txn:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+    await db.transactions.update_one(
+        {"_id": txn_id, "user_id": user_id},
+        {
+            "$set": {
+                "needs_verification": False,
+                "verification_status": "user_reviewed",
+                "parsing_confidence": "high",
+                "user_confirmed_at": datetime.datetime.utcnow(),
+            }
+        }
+    )
+    return {"status": "ok"}
